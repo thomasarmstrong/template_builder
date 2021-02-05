@@ -106,10 +106,13 @@ class TemplateFitter:
         if self.verbose:
             print("Reading", filename.strip())
 
-        calibrator = CameraCalibrator(image_extractor=FullWaveformSum())
+        # calibrator = CameraCalibrator(image_extractor=FullWaveformSum())
+        calibrator = None
 
         with event_source(input_url=filename.strip()) as source:
 
+            if calibrator is None:
+                calibrator = CameraCalibrator(source.subarray, image_extractor=FullWaveformSum(source.subarray))
             grd_tel = None
             num = 0  # Event counter
 
@@ -144,7 +147,7 @@ class TemplateFitter:
                 # Store ground position of all telescopes
                 # We only want to do this once, but has to be done in event loop
                 if grd_tel is None:
-                    grd_tel = event.inst.subarray.tel_coords
+                    grd_tel = source.subarray.tel_coords
 
 
                     # Convert to tilted system
@@ -161,17 +164,17 @@ class TemplateFitter:
 
                 # Loop over triggered telescopes
                 for tel_id in event.dl0.tels_with_data:
-                   #  Get pixel signal
-                    try:
-                        hg, lg =np.sum(event.r1.tel[tel_id].waveform, axis=2)
-                        pmt_signal = hg
-                        pmt_signal[pmt_signal>150] = lg[pmt_signal>150]
-                    except ValueError:
-                        pmt_signal = np.sum(event.r1.tel[tel_id].waveform, axis=-1)[0]
-
+                   #  Get pixel signal, Why like this? You have already calibrated the image
+                   #  try:
+                   #      hg, lg =np.sum(event.r1.tel[tel_id].waveform, axis=2)
+                   #      pmt_signal = hg
+                   #      pmt_signal[pmt_signal>150] = lg[pmt_signal>150]
+                   #  except ValueError:
+                   #      pmt_signal = np.sum(event.r1.tel[tel_id].waveform, axis=-1)[0]
+                    pmt_signal = event.dl1.tel[tel_id].image
                     # Get pixel coordinates and convert to the nominal system
-                    geom = event.inst.subarray.tel[tel_id].camera
-                    fl = event.inst.subarray.tel[tel_id].optics.equivalent_focal_length * \
+                    geom = source.subarray.tel[tel_id].camera.geometry
+                    fl = source.subarray.tel[tel_id].optics.equivalent_focal_length * \
                          self.eff_fl
 
                     camera_coord = SkyCoord(x=geom.pix_x, y=geom.pix_y,
@@ -181,8 +184,8 @@ class TemplateFitter:
                     nom_coord = camera_coord.transform_to(
                         NominalFrame(origin=point))
 
-                    y = nom_coord.delta_az.to(u.deg)
-                    x = nom_coord.delta_alt.to(u.deg)
+                    x = nom_coord.fov_lat.to(u.deg)
+                    y = nom_coord.fov_lon.to(u.deg)
 
                     # Calculate expected rotation angle of the image
                     phi = np.arctan2((tilt_tel.y[tel_id - 1] - tilt_core_true.y),
@@ -198,8 +201,8 @@ class TemplateFitter:
                     # another
                     x, y = \
                         ImPACTReconstructor.rotate_translate(x, y,
-                                                             source_direction.delta_alt,
-                                                             source_direction.delta_az,
+                                                             source_direction.fov_lat,
+                                                             source_direction.fov_lon,
                                                              phi)
                     x *= -1
 
@@ -443,7 +446,7 @@ class TemplateFitter:
             #print(points_z.shape, points, out.shape)
 
             av_z = np.average(points_z)
-            print(av_z, ((np.max(points_z)-np.min(points_z))/2.) + np.min(points_z))
+            # print(av_z, ((np.max(points_z)-np.min(points_z))/2.) + np.min(points_z))
             av_val = np.sum((out*points_z).reshape((self.bins[0], self.bins[1], 200)), axis=-1) / \
                 np.sum(out.reshape((self.bins[0], self.bins[1], 200)), axis=-1)
 
@@ -675,6 +678,81 @@ class TemplateFitter:
             pix_lists = None
             file_templates = None
             file_variance_templates = None
+
+        # Extend coverage of the templates by extrapolation if requested
+        if extend_range:
+            templates = self.extend_template_coverage(templates)
+            if make_variance:
+                variance_templates = self.extend_template_coverage(variance_templates)
+
+        if self.amplitude_correction:
+
+            for key in self.correction.keys():
+                correction_factor = np.median(self.correction[key])
+                correction_factor_error = np.std(self.correction[key]) / np.sqrt(float(len(self.correction[key])))
+
+                print(correction_factor_error / correction_factor, correction_factor)
+                if correction_factor > 0 and correction_factor_error / correction_factor < 0.1:
+                    self.template_fit[key] = self.template_fit[key] * np.median(self.correction[key])
+                else:
+                    self.template_fit.pop(key)
+
+        file_handler = gzip.open(output_file, "wb")
+        pickle.dump(self.template_fit, file_handler)
+        file_handler.close()
+
+        if make_variance:
+            file_handler = gzip.open(variance_output_file, "wb")
+            pickle.dump(variance_templates, file_handler)
+            file_handler.close()
+
+        return templates, variance_templates
+
+    def pool_generate_templates(self, filename, output_file, variance_output_file=None,
+                           extend_range=True, max_events=1e9, max_fitpoints=None):
+        """
+
+        :param file_list: list
+            List of sim_telarray input files
+        :param output_file: string
+            Output file name
+        :param variance_output_file: string
+            Output file name of variance templates
+        :param extend_range: bool
+            Extend range of the templates beyond simulations
+        :param max_events: int
+            Maximum number of events to process
+        :param max_fitpoints: int
+            Maximum number of points to include in the MLP fit
+        :return: dict
+            Dictionary of image templates
+
+        """
+
+        make_variance = variance_output_file is not None
+
+        templates = dict()
+        variance_templates = dict()
+
+        # for filename in file_list:
+        pix_lists = self.read_templates(filename, max_events)
+        file_templates, file_variance_templates = self.fit_templates(pix_lists[0],
+                                                                     pix_lists[1],
+                                                                     pix_lists[2],
+                                                                     make_variance,
+                                                                     max_fitpoints)
+        templates.update(file_templates)
+        self.template_fit = templates
+
+        if make_variance:
+            variance_templates.update(file_variance_templates)
+
+        if self.amplitude_correction:
+            _ = self.read_templates(filename, max_events, fill_correction=True)
+
+        pix_lists = None
+        file_templates = None
+        file_variance_templates = None
 
         # Extend coverage of the templates by extrapolation if requested
         if extend_range:
