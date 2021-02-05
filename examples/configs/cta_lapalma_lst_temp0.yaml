@@ -70,8 +70,8 @@ ShowerSimulation:
 
 TelescopeSimulation:
   config_name: "LST"
-  config_file: "cfg/CTA/CTA-PROD4-LST-simp.cfg"
+  config_file: "cfg/CTA/CTA-PROD4-LST.cfg"
   atmosphere: "atm_trans_2158_1_10_0_0_0.dat"
-  sim_telarray_directory: "/cta/armstron/Software/CorsikaSimtel/d2020-02-12"
+  sim_telarray_directory: "/pbs/home/t/tarmstro/Software/corsikaSimtelarray/d2020-02-12"
   extra_options: ""
   optical_efficiency: 1
